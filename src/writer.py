@@ -85,37 +85,47 @@ class FlowLayout:
         self.page = 0
         self.row = CONTENT_START_ROW
 
+        # ページ段管理（5カラムを超えたら下段＝次の印刷ページへ）
+        self.page_start_row = CONTENT_START_ROW
+        self.page_max_row = CONTENT_START_ROW
+        self.page_break_rows = []
+
     @property
     def _col_base(self) -> int:
         """現在のビジュアルカラムの開始Excel列番号（1始まり）。A列はマージン。"""
-        abs_col = self.page * self.cols_per_page + self.visual_col
-        return abs_col * STRIDE + 1 + LEFT_MARGIN
+        return self.visual_col * STRIDE + 1 + LEFT_MARGIN
 
     def _col(self, offset: int) -> int:
         """列オフセットからExcel列番号を返す。"""
         return self._col_base + offset
 
     def can_fit(self, height: int) -> bool:
-        return (self.row + height - 1) <= (CONTENT_START_ROW + self.max_rows - 1)
+        return (self.row + height - 1) <= (self.page_start_row + self.max_rows - 1)
 
     def next_column(self):
+        self.page_max_row = max(self.page_max_row, self.row)
         self.visual_col += 1
-        self.row = CONTENT_START_ROW
+        self.row = self.page_start_row
         if self.visual_col >= self.cols_per_page:
             self.page += 1
             self.visual_col = 0
+            # 現ページ最大行の直後にページブレークを挿入
+            break_row = self.page_max_row
+            self.page_break_rows.append(break_row)
+            # 上部マージン（HEADER_ROWS分）を空けてコンテンツ開始
+            self.page_start_row = break_row + HEADER_ROWS
+            self.row = self.page_start_row
+            self.page_max_row = self.page_start_row
 
     def ensure_fit(self, height: int):
         if not self.can_fit(height):
             self.next_column()
 
-    def write_division_header(self, division: Division):
-        """営業区分: 新しいカラムの先頭に移動（ヘッダー行なし）。"""
-        if self.row > CONTENT_START_ROW:
-            self.next_column()
-
     def write_partner_clients(self, partner: Partner, division_key: str = ""):
-        """取引先ブロック全体を1つの太線枠で縦配置で書き込む。
+        """取引先ブロックを顧客単位でカラムをまたいで書き込む。
+
+        顧客ブロック（顧客名＋案件＋メンバー）は途中で切らない。
+        カラムに収まらない場合は次カラムへ移動し、取引先名を再出力する。
 
         レイアウト:
           取引先名        ← COL_PARTNER   | 営業名    ← COL_GRADE
@@ -126,123 +136,154 @@ class FlowLayout:
               名前|部署|グレード  ← COL_NAME〜COL_GRADE
               ...
         """
-        height = partner.row_height()
-        self.ensure_fit(height)
-
-        col_base = self._col_base
-        col_end = col_base + EXCEL_COLS_PER_VISUAL - 1
-        start_row = self.row
+        PARTNER_HEADER_ROWS = 2
 
         font_partner = _make_font(config.LAYOUT["font_partner"])
         font_client = _make_font(config.LAYOUT["font_client"])
         font_project = _make_font(config.LAYOUT["font_project"])
         font_person = _make_font(config.LAYOUT["font_person"])
-
-        member_ranges = []  # メンバー間hair罫線用: [(first_row, last_row), ...]
-        border_starts = {}  # row -> 横罫線が始まる列オフセット
-        merged_rows = set()  # セル結合の上段行（下段との間に罫線なし）
-        client_vline_ranges = []  # col2右縦罫線: [(start_row, end_row), ...]
-        project_vline_ranges = []  # col3右縦罫線: [(start_row, end_row), ...]
-
-        # 取引先名（右5列 + 下1行をセル結合）
-        partner_row = self.row
-        cell = self.ws.cell(
-            row=partner_row, column=self._col(COL_PARTNER),
-            value=partner.display_name
-        )
-        cell.font = font_partner
-        cell.alignment = Alignment(vertical="center", shrink_to_fit=True)
-        self.ws.merge_cells(
-            start_row=partner_row,
-            start_column=self._col(COL_PARTNER),
-            end_row=partner_row + 1,
-            end_column=self._col(COL_PARTNER + 5),
-        )
-        merged_rows.add(partner_row)
-
-        # 担当営業名（上段 COL_GRADE）
         font_info = Font(name="ＭＳ Ｐゴシック", size=9, italic=True)
         align_right = Alignment(horizontal="right")
-        cell_div = self.ws.cell(
-            row=partner_row, column=self._col(COL_GRADE),
-            value=f"営業:{division_key}"
-        )
-        cell_div.font = font_info
-        cell_div.alignment = align_right
 
-        # 人数合計（下段 COL_GRADE）
-        cell_cnt = self.ws.cell(
-            row=partner_row + 1, column=self._col(COL_GRADE),
-            value=f"{partner.count}名"
-        )
-        cell_cnt.font = font_info
-        cell_cnt.alignment = align_right
+        # --- セグメント（カラム内の取引先部分ブロック）管理 ---
+        seg = {}
 
-        self.row += 1  # 取引先名行
-        self.row += 1  # 空行（結合に含まれる）
-        border_starts[self.row] = COL_CLIENT  # 取引先→最初の顧客
+        def _begin_segment():
+            """新しいセグメントを開始し、取引先ヘッダーを書き込む。"""
+            seg.clear()
+            seg["start_row"] = self.row
+            seg["col_base"] = self._col_base
+            seg["partner_row"] = self.row
+            seg["member_ranges"] = []
+            seg["border_starts"] = {}
+            seg["merged_rows"] = set()
+            seg["client_vline_ranges"] = []
+            seg["project_vline_ranges"] = []
+            seg["first_client"] = True
 
-        for ci, client in enumerate(partner.clients):
-            if ci > 0:
-                border_starts[self.row] = COL_CLIENT  # 顧客間の境界
+            # 取引先名（右5列 + 下1行をセル結合）
+            pr = self.row
+            cell = self.ws.cell(
+                row=pr, column=self._col(COL_PARTNER),
+                value=partner.display_name,
+            )
+            cell.font = font_partner
+            cell.alignment = Alignment(vertical="center", shrink_to_fit=True)
+            self.ws.merge_cells(
+                start_row=pr, start_column=self._col(COL_PARTNER),
+                end_row=pr + 1, end_column=self._col(COL_PARTNER + 5),
+            )
+            seg["merged_rows"].add(pr)
+
+            # 担当営業名（上段 COL_GRADE）
+            cell_div = self.ws.cell(
+                row=pr, column=self._col(COL_GRADE),
+                value=f"営業:{division_key}",
+            )
+            cell_div.font = font_info
+            cell_div.alignment = align_right
+
+            # 人数合計（下段 COL_GRADE）
+            cell_cnt = self.ws.cell(
+                row=pr + 1, column=self._col(COL_GRADE),
+                value=f"{partner.count}名",
+            )
+            cell_cnt.font = font_info
+            cell_cnt.alignment = align_right
+
+            self.row += PARTNER_HEADER_ROWS
+            seg["border_starts"][self.row] = COL_CLIENT
+
+        def _end_segment():
+            """現セグメントの罫線を適用して閉じる。"""
+            if not seg:
+                return
+            end_row = self.row - 1
+            if end_row < seg["start_row"]:
+                return
+            col_base = seg["col_base"]
+            col_end = col_base + EXCEL_COLS_PER_VISUAL - 1
+            _apply_partner_borders(
+                self.ws, seg["start_row"], end_row, col_base, col_end,
+                seg["member_ranges"], seg["border_starts"],
+                seg["merged_rows"],
+                partner_row=seg["partner_row"],
+                client_vline_ranges=seg["client_vline_ranges"],
+                project_vline_ranges=seg["project_vline_ranges"],
+            )
+
+        # --- 最初のセグメント開始 ---
+        first_h = partner.clients[0].row_height() if partner.clients else 0
+        self.ensure_fit(PARTNER_HEADER_ROWS + first_h)
+        _begin_segment()
+
+        # --- 顧客ブロックを順に書き込み ---
+        for client in partner.clients:
+            client_h = client.row_height()
+
+            # 現カラムに収まらなければセグメントを閉じて改カラム
+            if not self.can_fit(client_h):
+                _end_segment()
+                self.next_column()
+                self.ensure_fit(PARTNER_HEADER_ROWS + client_h)
+                _begin_segment()
+
+            if not seg["first_client"]:
+                seg["border_starts"][self.row] = COL_CLIENT
+            seg["first_client"] = False
 
             # 顧客名（col6まで + 下1行をセル結合）
             client_row = self.row
             cell_c = self.ws.cell(
                 row=client_row, column=self._col(COL_CLIENT),
-                value=client.name
+                value=client.name,
             )
             cell_c.font = font_client
             cell_c.alignment = Alignment(vertical="center", shrink_to_fit=True)
             self.ws.merge_cells(
-                start_row=client_row,
-                start_column=self._col(COL_CLIENT),
-                end_row=client_row + 1,
-                end_column=self._col(COL_EMPTY),
+                start_row=client_row, start_column=self._col(COL_CLIENT),
+                end_row=client_row + 1, end_column=self._col(COL_EMPTY),
             )
-            merged_rows.add(client_row)
+            seg["merged_rows"].add(client_row)
 
             # 顧客人数合計（下段 COL_GRADE）
             cell_cc = self.ws.cell(
                 row=client_row + 1, column=self._col(COL_GRADE),
-                value=f"{client.count}名"
+                value=f"{client.count}名",
             )
             cell_cc.font = font_info
             cell_cc.alignment = align_right
 
-            self.row += 1  # 顧客名行
-            self.row += 1  # 空行（結合に含まれる）
-            border_starts[self.row] = COL_PROJECT  # 顧客→最初の案件
+            self.row += 2  # 顧客名行 + 空行（結合に含まれる）
+            seg["border_starts"][self.row] = COL_PROJECT
 
             for pi, project in enumerate(client.projects):
                 if pi > 0:
-                    border_starts[self.row] = COL_PROJECT  # 案件間の境界
+                    seg["border_starts"][self.row] = COL_PROJECT
 
                 # 案件名（col6までセル結合）
                 proj_row = self.row
                 cell_p = self.ws.cell(
                     row=proj_row, column=self._col(COL_PROJECT),
-                    value=project.name
+                    value=project.name,
                 )
                 cell_p.font = font_project
                 cell_p.alignment = Alignment(shrink_to_fit=True)
                 self.ws.merge_cells(
-                    start_row=proj_row,
-                    start_column=self._col(COL_PROJECT),
-                    end_row=proj_row,
-                    end_column=self._col(COL_EMPTY),
+                    start_row=proj_row, start_column=self._col(COL_PROJECT),
+                    end_row=proj_row, end_column=self._col(COL_EMPTY),
                 )
 
                 # 案件人数（COL_GRADE）
                 cell_pc = self.ws.cell(
                     row=proj_row, column=self._col(COL_GRADE),
-                    value=f"{project.count}名"
+                    value=f"{project.count}名",
                 )
                 cell_pc.font = font_info
                 cell_pc.alignment = align_right
 
                 self.row += 1  # 案件名行
-                border_starts[self.row] = COL_NAME  # 案件名下: col3は罫線なし、col4以降はthin
+                seg["border_starts"][self.row] = COL_NAME
 
                 # メンバー（案件名の直下）
                 first_member_row = self.row
@@ -250,44 +291,38 @@ class FlowLayout:
                     r = self.row
                     cell_n = self.ws.cell(
                         row=r, column=self._col(COL_NAME),
-                        value=member.name
+                        value=member.name,
                     )
                     cell_n.font = font_person
                     cell_n.alignment = Alignment(shrink_to_fit=True)
                     self.ws.cell(
                         row=r, column=self._col(COL_DEPT),
-                        value=member.dept
+                        value=member.dept,
                     ).font = font_person
                     if not member.is_bp and member.grade:
                         self.ws.cell(
                             row=r, column=self._col(COL_GRADE),
-                            value=member.grade
+                            value=member.grade,
                         ).font = font_person
                     self.row += 1
                 last_member_row = self.row - 1
                 if project.count >= 2:
-                    member_ranges.append((first_member_row, last_member_row))
+                    seg["member_ranges"].append(
+                        (first_member_row, last_member_row))
                     for mr in range(first_member_row + 1, last_member_row + 1):
-                        border_starts[mr] = COL_NAME  # メンバー間
+                        seg["border_starts"][mr] = COL_NAME
 
                 # col3 右縦罫線: 案件名の1行下からメンバー最終行まで
                 if project.count >= 1:
-                    project_vline_ranges.append(
-                        (proj_row + 1, last_member_row)
-                    )
+                    seg["project_vline_ranges"].append(
+                        (proj_row + 1, last_member_row))
 
             # col2 右縦罫線: 顧客名セルの2行下から顧客最終行まで
-            client_vline_ranges.append((client_row + 2, self.row - 1))
+            seg["client_vline_ranges"].append(
+                (client_row + 2, self.row - 1))
 
-        # 罫線適用
-        end_row = self.row - 1
-        _apply_partner_borders(
-            self.ws, start_row, end_row, col_base, col_end,
-            member_ranges, border_starts, merged_rows,
-            partner_row=partner_row,
-            client_vline_ranges=client_vline_ranges,
-            project_vline_ranges=project_vline_ranges,
-        )
+        # 最終セグメントを閉じる
+        _end_segment()
 
         # 取引先ブロック間の空白行
         self.row += PARTNER_GAP_ROWS
@@ -417,16 +452,31 @@ def _setup_column_widths(ws, total_visual_cols: int):
             ws.column_dimensions[get_column_letter(base + EXCEL_COLS_PER_VISUAL)].width = _w(layout["col_width_gap"])
 
 
-def _setup_print(ws, total_pages: int, cols_per_page: int):
-    """印刷設定（A3横、ページ区切り）。"""
-    ws.page_setup.paperSize = ws.PAPERSIZE_A3
+def _setup_print(ws, page_break_rows: list, last_row: int):
+    """印刷設定（A4横、印刷範囲固定、行ページブレーク）。"""
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
+    ws.page_setup.scale = 48
 
-    for p in range(1, total_pages):
-        break_col = p * cols_per_page * STRIDE + 1 + LEFT_MARGIN
-        ws.col_breaks.append(Break(id=break_col))
+    # 余白（cm → inches）
+    _CM = 1 / 2.54
+    ws.page_margins.top = 0.5 * _CM
+    ws.page_margins.bottom = 0.5 * _CM
+    ws.page_margins.left = 0.8 * _CM
+    ws.page_margins.right = 0.8 * _CM
+    ws.page_margins.header = 0.8 * _CM
+    ws.page_margins.footer = 0.8 * _CM
+
+    # 印刷範囲: A列〜AO列（5カラム分）を1ページ幅として固定
+    last_col_num = LEFT_MARGIN + config.LAYOUT["columns_per_page"] * STRIDE
+    last_col = get_column_letter(last_col_num)
+    ws.print_area = f"A1:{last_col}{last_row}"
+
+    # 列方向のページ境界: AO列の次列で区切り、横幅を1ページに固定
+    ws.col_breaks.append(Break(id=last_col_num + 1))
+
+    for break_row in page_break_rows:
+        ws.row_breaks.append(Break(id=break_row))
 
 
 def generate(divisions: list[Division], output_dir: Path) -> Path:
@@ -442,8 +492,9 @@ def generate(divisions: list[Division], output_dir: Path) -> Path:
             ns.font = Font(name="ＭＳ Ｐゴシック", size=11)
             break
 
-    # 目盛線を非表示
+    # 目盛線を非表示、改ページプレビューで開く
     ws.sheet_view.showGridLines = False
+    ws.sheet_view.view = "pageBreakPreview"
 
     # タイトル行（1行目は空、2行目にタイトル）
     title = f"【{_make_title_date()}】"
@@ -455,15 +506,14 @@ def generate(divisions: list[Division], output_dir: Path) -> Path:
     flow = FlowLayout(ws)
 
     for division in divisions:
-        flow.write_division_header(division)
         for partner in division.partners:
             flow.write_partner_clients(partner, division_key=division.key)
 
-    # 列幅・印刷設定
-    total_visual_cols = (flow.page * flow.cols_per_page
-                        + flow.visual_col + 1)
+    # 列幅・印刷設定（常に5カラム分の列幅を固定）
+    total_visual_cols = flow.cols_per_page
     _setup_column_widths(ws, total_visual_cols)
-    _setup_print(ws, flow.page + 1, flow.cols_per_page)
+    last_row = max(flow.page_max_row, flow.row)
+    _setup_print(ws, flow.page_break_rows, last_row)
 
     # 出力
     output_dir.mkdir(parents=True, exist_ok=True)

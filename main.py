@@ -11,10 +11,25 @@ from src.processor import process
 from src.writer import generate
 
 
+def _find_csv(pattern: str) -> Path:
+    """inputフォルダからパターンに一致するCSVを1件検索する。"""
+    csv_files = sorted(config.CSV_DIR.glob(pattern))
+    if not csv_files:
+        print(f"エラー: {config.CSV_DIR} に {pattern} が見つかりません")
+        sys.exit(1)
+    if len(csv_files) > 1:
+        print(f"エラー: {pattern} に該当するファイルが複数あります。1つにしてください:")
+        for f in csv_files:
+            print(f"  - {f.name}")
+        sys.exit(1)
+    return csv_files[0]
+
+
 def main():
     # 1. CSV読込
-    print(f"CSV読込: {config.CSV_PATH}")
-    df = read_csv(config.CSV_PATH, config.CSV_ENCODING)
+    csv_path = _find_csv(config.CSV_PATTERN)
+    print(f"CSV読込: {csv_path}")
+    df = read_csv(csv_path, config.CSV_ENCODING)
     print(f"  {len(df)}件のレコードを読み込みました")
 
     # 2. データ加工
